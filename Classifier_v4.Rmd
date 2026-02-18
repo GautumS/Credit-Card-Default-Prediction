@@ -1,0 +1,819 @@
+---
+title: "classifierv2"
+output:
+  pdf_document: default
+  html_document: default
+date: "2025-11-17"
+---
+
+Clears Environment
+```{r}
+rm( list=ls() ) # remove all existing objects in the environment
+gc() # garbage collection
+```
+
+Import Statements
+```{r}
+# Import statements
+library(readxl)
+library(Amelia)
+library(rsample)
+library(dplyr)
+library(rpart); library(rpart.plot)
+library(ggplot2)
+library(tidyr)
+library(class)
+library(glmnet)
+library(randomForest)
+
+```
+
+
+---DATA PREPROCESSING----
+Step 1: Check missing values pattern
+```{r}
+# cleans data
+clean_dat <- function(df ) {
+  print(dim(df))
+  matrix_na = is.na(df)
+  # proportion of missing for each column, row
+  pmiss = colMeans(matrix_na) 
+  nmiss = rowMeans(matrix_na)
+  print(pmiss)
+  plot(pmiss)
+}
+
+```
+
+Step 2/3: Visualizes data
+```{r}
+visualize_distributions <- function(df) {
+  #  Finds numeric vars
+  numeric_cols <- names(df)[sapply(df, is.numeric)]
+  
+  # Loops through variables and makes boxplot/histogram
+  cat(sprintf(" Visualizations for %d variables \n", length(numeric_cols)))
+
+  for (col_name in numeric_cols) {
+    cat(sprintf("\nVisualizing variable: %s\n", col_name))
+    # Select data
+    data_plot <- df %>% select(!!sym(col_name))
+    # Boxplot 
+    p_box <- ggplot(data_plot, aes(y = !!sym(col_name), x = "")) +
+      geom_boxplot(fill = "Blue", color = "Purple") +
+      ggtitle(paste("Boxplot:", col_name)) +
+      labs(x = NULL, y = col_name)
+
+    #  Histogram 
+    p_hist <- ggplot(data_plot, aes(x = !!sym(col_name))) +
+      geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "green") +
+      # Add density curve 
+      geom_density(color = "orange") +
+      ggtitle(paste("Histogram (with Density):", col_name)) +
+      labs(x = col_name, y = "Density") 
+
+    # Print plots
+    print(p_box)
+    print(p_hist)
+  }
+}
+```
+
+Step 4: Dummy variables: All variables are already one hot encoded so no dummy variables are needed
+
+Step 5: Correlation Table, PCA necessary
+```{r}
+# Returns Correlation Table
+get_cor_table<- function(df, threshold = .8){
+  cor_data = cor(df)
+  print("Correlation matrix")
+  return(cor_data)
+}
+
+# high corelation pairs
+get_cor_pairs <- function(cor_matrix, threshold=.8){
+  abs_matrix <- abs((cor_matrix))
+  vars <- colnames(abs_matrix)
+  pairs <- expand.grid(Var_1 = vars,Var_2 = vars)
+  pairs$Absolute_Correlation <- c(abs_matrix)
+  # Filter pairs
+  result <- pairs %>%
+    dplyr::filter(Absolute_Correlation > threshold) %>%
+    #  no self-correlation
+    dplyr::filter(Var_1 != Var_2) %>%
+
+  return(result)
+}
+```
+
+---- CREATES FUNCTIONS ------
+Evaluation Functions
+```{r}
+# Accuracy
+acc <- function(y, yhat) mean(y == yhat)
+#Sensativity
+sen <- function(y, yhat) {
+  ind <- which(y == 1)
+  mean(y[ind] == yhat[ind])
+}
+#Specificity
+spe <- function(y, yhat) {
+  ind <- which(y == 0)
+  mean(y[ind] == yhat[ind])
+}
+```
+
+PCA
+```{r}
+# Helper function: run PCA 
+PCA_helper <- function(data_block, block_name, threshold = .9) {
+  
+  print(paste("PCA for: ", block_name))
+  print(paste("Columns used: ", paste(colnames(data_block), collapse=", ")))
+  
+  # Run PCA, no scaling
+  pca_obj <- prcomp(data_block, scale = FALSE)
+  
+  # Print PCA summary
+  print(summary(pca_obj))
+  
+  # Variance explained
+  var_exp <- summary(pca_obj)$importance[2, ]
+  cum_var_exp <- summary(pca_obj)$importance[3, ]
+  print("% Variance explained :")
+  print(round(var_exp, 4))
+  print("% Cumulative variance explained:")
+  print(round(cum_var_exp, 4))
+  
+  # selcts components
+  num_pc <- which(cum_var_exp >= threshold)[1]
+  print(paste("Keeping ", num_pc, " components"))
+  # Extract PCA scores
+  pc_scores <- pca_obj$x[, 1:num_pc, drop=FALSE]
+  # Rename PCA cols
+  colnames(pc_scores) <- paste0(block_name, "_PC", 1:num_pc)
+  
+  # PCA vector vals
+  pc_loadings <- pca_obj$rotation[, 1:num_pc, drop = FALSE]
+  print(as.data.frame(pc_loadings))
+  
+  return(list(scores = pc_scores, pca = pca_obj))
+}
+
+# Selects cols and calls PCA
+do_pca <- function(df, thres = .9) {
+  
+  # Extract blocks 
+  block1 <- df[, 6:11]
+  block2 <- df[, 12:17]
+  
+  # Run PCA
+  pca1 <- PCA_helper(block1, "Block1", threshold = thres)
+  pca2 <- PCA_helper(block2, "Block2", threshold = thres)
+  
+  # replaces PCA cols
+  df_new <- df
+  df_new <- df_new[, -c(6:11)] 
+  df_new <- df_new[, -c((12:17) - 6)] 
+  
+  # Adds new cols
+  df_new <- cbind(df_new, pca1$scores, pca2$scores)
+  
+  return(df_new)
+}
+
+
+```
+
+
+Test/train split 
+```{r}
+balanced_split <- function(df, size = 0.8) {
+  
+  set.seed(1)
+  
+  # Standard split
+  n <- nrow(df)
+  train_idx <- sample(1:n, floor(size * n))
+  train_df <- df[train_idx, ]
+  test_df  <- df[-train_idx, ]
+  
+  # Balance  training set 
+  train0 <- train_df[train_df$default == 0, ]
+  train1 <- train_df[train_df$default == 1, ]
+  k <- min(nrow(train0), nrow(train1))
+  train0_bal <- train0[sample(1:nrow(train0), k), ]
+  train1_bal <- train1[sample(1:nrow(train1), k), ]
+  
+  # Combine
+  train_balanced <- rbind(train0_bal, train1_bal)
+  
+  # Shuffle 
+  train_balanced <- train_balanced[sample(1:nrow(train_balanced)), ]
+  
+  return(list(
+    train = train_balanced,
+    test  = test_df
+  ))
+}
+```
+
+
+Logistic regression
+```{r}
+log_reg <- function(train, test, y_var) {
+  
+  # Create formulas 
+  full_formula <- as.formula(paste0(y_var, " ~ ."))
+  null_formula <- as.formula(paste0(y_var, " ~ 1"))
+  
+  # Create models
+  null_model  <- glm(null_formula, data=train, family="binomial")
+  full_model  <- glm(full_formula, data=train, family="binomial")
+  
+  model_forward  <- step(null_model, direction="forward", scope=formula(full_model), trace=0)
+  model_backward <- step(full_model, direction="backward", trace=0)
+  model_step  <- step(null_model, direction="both", scope=formula(full_model), trace=0)
+  
+  models <- list(
+    Forward  = model_forward,
+    Backward = model_backward,
+    Stepwise = model_step
+  )
+  
+  cutoffs <- c(.5, .3, .1)
+  
+  # Output df
+  results <- data.frame(
+    Model = character(),
+    Cutoff = numeric(),
+    Accuracy = numeric(),
+    Sensitivity = numeric(),
+    Specificity = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Applies to models
+  for (m_name in names(models)) {
+    mod <- models[[m_name]]
+    
+    # pvals
+    p_hat <- predict(mod, newdata=test, type="response")
+    #cutoffs
+    for (ct in cutoffs) {
+      yhat <- ifelse(p_hat > ct, 1, 0)
+      ytrue <- test[[y_var]]
+
+      results <- rbind(results,
+                       data.frame(
+                         Model = m_name,
+                         Cutoff = ct,
+                         Accuracy = acc(ytrue, yhat),
+                         Sensitivity = sen(ytrue, yhat),
+                         Specificity = spe(ytrue, yhat),
+                         stringsAsFactors = FALSE
+                       ))
+      # Changes, delete if needed
+      model = get_or(summary(mod, alpha = ct))
+      model <- as.data.frame(model)
+      print(model)
+    }
+  }
+  return(results)
+}
+
+# Returns df on function info
+get_or = function(sobj, alpha=.05) {
+  b = sobj$coef[-1, 'Estimate']
+  se_b = sobj$coef[-1, 'Std. Error']
+  pval = sobj$coef[-1, 'Pr(>|z|)']
+  or = exp(b)-1; se_or = exp(b)*se_b
+  lb = b + qnorm(alpha/2)*se_b; lb_or = exp(lb)
+  ub = b + qnorm(1-alpha/2)*se_b; ub_or = exp(ub)
+  out = cbind(or, se_or, lb_or, ub_or, pval)
+  colnames(out) = c('OR', 'SE', paste0((1-alpha)*100, '% CI, lower'),
+                    paste0((1-alpha)*100, '% CI, upper'), 'p value')
+  return(out)
+}
+
+
+```
+
+Ridge Regression
+Lasso and Ridge regression code from Stanford Online
+```{r}
+run_ridge <- function(test, train, y_var) {
+  vars <- setdiff(colnames(train), y_var)
+
+  # x/y split
+  x_train <- as.matrix(train[, vars])
+  x_test  <- as.matrix(test[, vars])
+  y_train <- train[[y_var]]
+  y_test  <- test[[y_var]]
+
+  # fits model
+  fit.ridge = glmnet(x_train, y_train, alpha =0, family = "binomial")
+  # model
+  cv.ridge= cv.glmnet(x_train, y_train, alpha = 0, family = "binomial")
+  
+  # Plots information
+  # plots the values of the coefficients with different lamndas
+  plot(fit.ridge, xvar = "lambda", label = TRUE)
+  # plots % Rsquare explained
+  plot(fit.ridge, xvar = "dev", label = TRUE)
+  # model error at different lambdas
+  plot(cv.ridge)
+  
+
+  
+  # Coefficients at differnt lambda values
+  print(paste("minimum CV error", cv.ridge$lambda.min))
+  print(coef(cv.ridge, s = cv.ridge$lambda.min))
+  print(paste("sparese model", cv.ridge$lambda.1se))
+  print(coef(cv.ridge, s = cv.ridge$lambda.1se))
+
+  # selects lambda
+  pred = predict(cv.ridge, x_test, s = cv.ridge$lambda)
+  rmse = sqrt(apply((y_test - pred)^2, 2, mean))
+  # RMSE at different lambda vals
+  plot(log(cv.ridge$lambda), rmse, type = "b", xlab = "log(lambda)")
+
+  lam.best = cv.ridge$lambda[order(rmse)[1]]
+  print("Least RMSE lambda:")
+  print(lam.best)
+  print(coef(cv.ridge, s = lam.best))
+
+  lam_list <- c(
+    lam.best,
+    cv.ridge$lambda.min,
+    cv.ridge$lambda.1se
+  )
+
+  cutoffs <- c(.1, .3, .5)
+  
+  # makes df
+  results_df <- data.frame(
+    lambda = numeric(),
+    cutoff = numeric(),
+    accuracy = numeric(),
+    sensitivity = numeric(),
+    specificity = numeric()
+  )
+
+  for (lam in lam_list) {
+    probs <- as.numeric(predict(cv.ridge, x_test, s = lam, type = "response"))
+
+    for (c in cutoffs) {
+      preds <- ifelse(probs > c, 1, 0)
+
+      results_df <- rbind(
+        results_df,
+        data.frame(
+          lambda = lam,
+          cutoff = c,
+          accuracy = acc(y_test, preds),
+          sensitivity = sen(y_test, preds),
+          specificity = spe(y_test, preds)
+        )
+      )
+    }
+  }
+
+  return(results_df)
+}
+```
+
+Laso, credit stanford online
+```{r}
+run_lasso <- function(test, train, y_var) {
+  vars <- setdiff(colnames(train), y_var)
+
+  # x/y split
+  x_train <- as.matrix(train[, vars])
+  x_test  <- as.matrix(test[, vars])
+  y_train <- train[[y_var]]
+  y_test  <- test[[y_var]]
+
+  # fits model
+  fit.lasso = glmnet(x_train,y_train)
+  # model
+  cv.lasso = cv.glmnet(x_train,y_train)
+  
+  # Plots information
+  # coefficient weights at different lambdas
+  plot(fit.lasso, xvar = "lambda", label = TRUE)
+  # plots % Rsquare explained
+  plot(fit.lasso, xvar = "dev", label = TRUE)
+  # model error at different lambdas
+  plot(cv.lasso)
+  
+
+  
+  # Coefficients at differnt lambda values
+  print(paste("minimum CV error", cv.lasso$lambda.min))
+  print(coef(cv.lasso, s = cv.lasso$lambda.min))
+  print(paste("sparese model", cv.lasso$lambda.1se))
+  print(coef(cv.lasso, s = cv.lasso$lambda.1se))
+
+  # selects lambda
+  pred = predict(cv.lasso, x_test, s = cv.lasso$lambda)
+  rmse = sqrt(apply((y_test - pred)^2, 2, mean))
+  # RMSE at different lambda vals
+  plot(log(cv.lasso$lambda), rmse, type = "b", xlab = "log(lambda)")
+
+  lam.best = cv.lasso$lambda[order(rmse)[1]]
+  print("Least RMSE lambda:")
+  print(lam.best)
+  print(coef(cv.lasso, s = lam.best))
+
+  lam_list <- c(
+    lam.best,
+    cv.lasso$lambda.min,
+    cv.lasso$lambda.1se
+  )
+
+  cutoffs <- c(.1, .3, .5)
+  
+  # makes df
+  results_df <- data.frame(
+    lambda = numeric(),
+    cutoff = numeric(),
+    accuracy = numeric(),
+    sensitivity = numeric(),
+    specificity = numeric()
+  )
+
+  for (lam in lam_list) {
+    probs <- predict(cv.lasso, x_test, s = lam, type = "response")
+
+    for (c in cutoffs) {
+      preds <- ifelse(probs > c, 1, 0)
+
+      results_df <- rbind(
+        results_df,
+        data.frame(
+          lambda = lam,
+          cutoff = c,
+          accuracy = acc(y_test, preds),
+          sensitivity = sen(y_test, preds),
+          specificity = spe(y_test, preds)
+        )
+      )
+    }
+  }
+
+  return(results_df)
+}
+```
+
+
+kNN
+```{r}
+knn_eval <- function(train, test, y_var, x_vars = NULL, k_max = 25, nfolds = 10, cutoffs = c(.5, .3, .1)) {
+
+  # Select variables
+  if (is.null(x_vars)) {
+    x_vars <- setdiff(colnames(train), y_var)
+  }
+  
+  # Normalize
+  normalize <- function(x) (x - min(x)) / (max(x) - min(x))
+  train_norm <- train
+  test_norm  <- test
+  
+  for (v in x_vars) {
+    if (is.numeric(train[[v]])) {
+      train_norm[[v]] <- normalize(train[[v]])
+      test_norm[[v]]  <- (test[[v]] - min(train[[v]])) /
+                         (max(train[[v]]) - min(train[[v]]))
+    }
+  }
+  
+  # x/y split
+  xtrain <- train_norm[, x_vars, drop=FALSE]
+  ytrain <- train_norm[[y_var]]
+  xtest  <- test_norm[, x_vars, drop=FALSE]
+  ytest  <- test_norm[[y_var]]
+  
+  #  k-fold CV 
+  folds <- sample(rep(1:nfolds, length.out = nrow(train_norm)))
+  cv_error <- rep(0, k_max)
+  
+  for (k in 1:k_max) {
+    fold_err <- c()
+    
+    for (f in 1:nfolds) {
+      val_idx <- which(folds == f)
+      tr_idx  <- setdiff(1:nrow(train_norm), val_idx)
+      x_tr <- xtrain[tr_idx, , drop=FALSE]
+      x_va <- xtrain[val_idx, , drop=FALSE]
+      y_tr <- ytrain[tr_idx]
+      y_va <- ytrain[val_idx]
+      pred_raw <- knn(x_tr, x_va, factor(y_tr), k = k, prob = TRUE)
+      probs <- attr(pred_raw, "prob")
+      probs <- ifelse(pred_raw == "1", probs, 1 - probs)
+      pred_class <- ifelse(probs > 0.5, 1, 0)  # CV always uses 0.5
+      fold_err[f] <- mean(pred_class != y_va)
+    }
+    cv_error[k] <- mean(fold_err)
+  }
+  
+  best_k <- which.min(cv_error)
+  
+  # plots accuracy
+  plot(1:k_max, 1 - cv_error, type = "b",
+       xlab = "k", ylab = "Cross-Validated Accuracy",
+       main = "KNN Accuracy vs K")
+  
+
+  # final model 
+  pred_raw <- knn(xtrain, xtest, factor(ytrain), k = best_k, prob = TRUE)
+  probs <- attr(pred_raw, "prob")
+  probs <- ifelse(pred_raw == "1", probs, 1 - probs)
+  
+  # Evaluate  
+
+  sensitivity <- function(ytrue, ypred) mean(ypred[ytrue == 1] == 1)
+  specificity <- function(ytrue, ypred) mean(ypred[ytrue == 0] == 0)
+  
+  results <- list()
+  
+  for (i in cutoffs) {
+    pred_class <- ifelse(probs > i, 1, 0)
+    
+    acc <- mean(pred_class == ytest)
+    sen <- sensitivity(ytest, pred_class)
+    spe <- specificity(ytest, pred_class)
+    
+    results[[paste0("cut_", i)]] <- data.frame(
+      best_k = best_k,
+      cutoff = i,
+      accuracy = acc,
+      sensitivity = sen,
+      specificity = spe
+    )
+  }
+  
+  out <- do.call(rbind, results)
+  rownames(out) <- NULL
+  return(out)
+}
+
+```
+
+Decision Tree
+```{r}
+build_tree <- function(train, test, y_var, cutoffs = c(.5, .3, .1)) {
+
+  sensitivity <- function(ytrue, ypred) mean(ypred[ytrue == 1] == 1)
+  specificity <- function(ytrue, ypred) mean(ypred[ytrue == 0] == 0)
+
+
+  # Build tree
+  x_vars <- setdiff(colnames(train), y_var)
+  form <- as.formula(paste(y_var, "~", paste(x_vars, collapse = "+")))
+  tree0 <- rpart(form, method = "class", data = train, xval = 10)
+
+  # Minimum Error Tree
+  min_cp <- tree0$cptable[which.min(tree0$cptable[, "xerror"]), "CP"]
+  min_error_tree <- prune(tree0, cp = min_cp)
+
+  cat("Minimum Error Tree:\n")
+  rpart.plot(min_error_tree, main = paste("Min Error Tree (CP =", round(min_cp, 4), ")"))
+
+  # Best Pruned Tree 
+  ind_min <- which.min(tree0$cptable[, "xerror"])
+  se_1 <- tree0$cptable[ind_min, "xstd"] / sqrt(10)
+  target_xerr <- min(tree0$cptable[, "xerror"]) + se_1
+
+  ind_best <- which.min(abs(tree0$cptable[1:ind_min, "xerror"] - target_xerr))
+  best_cp <- tree0$cptable[ind_best, "CP"]
+  best_pruned_tree <- prune(tree0, cp = best_cp)
+
+  cat("Displaying Best Pruned Tree (1-SE Rule):\n")
+  rpart.plot(best_pruned_tree, main = paste("Best Pruned Tree (CP =", round(best_cp, 4), ")"))
+
+  # Prediction metrics
+  evaluate_cutoff <- function(model, cutoff) {
+    prob <- predict(model, newdata = test, type = "prob")[, 2]
+    pred <- ifelse(prob > cutoff, 1, 0)
+    y_test <- test[[y_var]]
+
+    data.frame(
+      cutoff = cutoff,
+      accuracy = mean(pred == y_test),
+      sensitivity = sensitivity(y_test, pred),
+      specificity = specificity(y_test, pred)
+    )
+  }
+
+  # Run models
+  results <- list()
+
+  # Min error tree evaluations
+  for (c in cutoffs) {
+    tmp <- evaluate_cutoff(min_error_tree, c)
+    tmp$model <- paste0("MinError_CP=", round(min_cp, 4))
+    results[[paste0("min_", c)]] <- tmp
+  }
+
+  # Best-pruned tree evaluations
+  for (c in cutoffs) {
+    tmp <- evaluate_cutoff(best_pruned_tree, c)
+    tmp$model <- paste0("BestPruned_CP=", round(best_cp, 4))
+    results[[paste0("best_", c)]] <- tmp
+  }
+
+  # Combine
+  out <- do.call(rbind, results)
+  out <- out[, c("model", "cutoff", "accuracy", "sensitivity", "specificity")]
+
+  rownames(out) <- NULL
+  return(out)
+}
+
+```
+
+Random Forest
+```{r}
+build_forest <- function(test, train, y_var, ntree = 500) {
+  
+  # Convert Response to factor
+  train[[y_var]] <- as.factor(train[[y_var]])
+  test[[y_var]]  <- as.factor(test[[y_var]])
+  
+
+  # Build Model Formula
+  x_vars <- setdiff(colnames(train), y_var)
+  form <- as.formula(paste(y_var, "~", paste(x_vars, collapse = "+")))
+
+  # Train Random Forest Model
+  rf_fit <- randomForest(
+    formula = form,
+    data = train,
+    ntree = ntree,
+    importance = TRUE,
+    proximity  = TRUE
+  )
+  
+  # Gini importance plot 
+  varImpPlot(rf_fit, type = 2, main = "Variable Importance Gini")
+  
+  # proximity MDS Plot
+  prox_mds <- cmdscale(1 - rf_fit$proximity)
+  plot(
+    prox_mds,
+    col = as.numeric(train[[y_var]]),
+    pch = 19,
+    main = "Proximity Plot"
+  )
+  
+  # class 1 probs
+  probs <- predict(rf_fit, test, type = "prob")[, 2]
+  
+  # Convert test response back to numeric (0/1)
+  y_test <- as.numeric(as.character(test[[y_var]]))
+  
+
+  # Cutoffs
+  cutoffs <- c(0.5, 0.3, 0.1)
+  
+  # Store  Performance
+  results <- data.frame(
+    Cutoff = numeric(),
+    Accuracy = numeric(),
+    Sensitivity = numeric(),
+    Specificity = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+
+  # Evaluate Model 
+  for (ct in cutoffs) {
+    
+    # Convert probabilities to class predictions
+    yhat <- ifelse(probs > ct, 1, 0)
+    
+    # Performance metrics
+    acc <- mean(yhat == y_test)
+    se  <- sen(y_test, yhat)
+    sp  <- spe(y_test, yhat)
+    
+    # Store results
+    results <- rbind(results, data.frame(
+      Cutoff = ct,
+      Accuracy = acc,
+      Sensitivity = se,
+      Specificity = sp
+    ))
+  }
+  
+  return(results)
+}
+
+```
+
+---- CALLS FUNCTIONS -----
+Imports data
+```{r}
+# imports data
+df = read_excel('cred_def.xlsx')
+```
+
+update all to drop ID in V3
+Drops bad data
+```{r}
+str(df)
+# Drop rows where education is 5, 6, or 7
+df <- df[!(df$EDUCATION %in% c(5, 6, 7)), ]
+# Drop rows where marital is 4
+df <- df[!(df$MARRIAGE %in% c(4)), ]
+# Drops ID
+df<- df[, !(names(df) %in% ("ID"))]
+
+```
+
+
+Data Preprocessing
+```{r}
+clean_dat(df)
+# sets default name
+names(df)[names(df) == 'default payment next month'] <- 'default'
+visualize_distributions(df)
+cor_table= get_cor_table(df)
+cor_pairs= get_cor_pairs(cor_table)
+cor_pairs
+```
+
+
+Does PCA
+```{r}
+df <- do_pca(df)
+# Checks for Correlation
+cor_table= get_cor_table(df)
+cor_pairs= get_cor_pairs(cor_table)
+cor_pairs
+
+```
+
+
+Calls test/train
+```{r}
+# test/train split
+split_int = balanced_split(df)
+```
+
+
+Calls logistic regression
+```{r}
+log_reg(split_int$train, split_int$test, "default")
+```
+
+Calls Ridge Regression
+```{r}
+
+ridge_df = run_ridge(split_int$train, split_int$test, "default") 
+ridge_df
+```
+
+Calls Lasso Regression
+```{r}
+
+lam_res = run_lasso(split_int$train, split_int$test, "default") 
+lam_res
+
+```
+
+
+
+Calls KNN
+For KNN screen to have more than certain corrolation with y variable. 
+Using KNN over Lasso or ridge because it is the most balance between Specificity and Sensativity. Lasso and Ridge are comprable
+```{r}
+k_NN_all <- knn_eval(split_int$train, split_int$test, "default", NULL, 50)
+k_NN_all
+good_vars = c("Block1_PC1", "Block1_PC2", "Block1_PC3", "Block2_PC1", "LIMIT_BAL") # Top 5 vars
+knn_good <- knn_eval(split_int$train, split_int$test, "default", good_vars, 50)
+knn_good
+log_vars = c("Block1_PC1", "Block1_PC2", "Block2_PC1", "Block1_PC3", "PAY_AMT2", "PAY_AMT1", "AGE", "LIMIT_BAL", "PAY_AMT6", "MARRIAGE") # 1% significance cutoff
+kNN_log <- knn_eval(split_int$train, split_int$test, "default", log_vars, 50)
+kNN_log
+
+# For k selection
+good_vars = c("Block1_PC1", "Block1_PC2", "Block1_PC3", "Block2_PC1", "LIMIT_BAL") # Top 5 vars
+knn_test <- knn_eval(split_int$train, split_int$test, "default", good_vars, 100)
+knn_test
+```
+
+Decision Tree
+```{r}
+dec_tree <- build_tree(split_int$train, split_int$test, "default")
+dec_tree
+```
+
+Random Forest
+```{r}
+forest <- build_forest(split_int$train, split_int$test, "default")
+forest
+```
+
